@@ -1,0 +1,332 @@
+# Import necessary libraries
+import asyncio
+import aiohttp
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import urllib.robotparser as robotparser
+import logging
+import json
+import nest_asyncio
+from pyvis.network import Network
+from IPython.display import display, HTML
+from asyncio import Semaphore
+
+# Apply nest_asyncio to allow nested event loops in Jupyter Notebook
+nest_asyncio.apply()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,  # Change to DEBUG for more verbose output
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('WebCrawler')
+
+class WebCrawler:
+    def __init__(self, seed_urls, max_tasks=10, rate_limit=1, update_interval=10, max_pages=50):
+        """
+        Initialize the crawler with seed URLs.
+
+        :param seed_urls: List of URLs to start crawling from.
+        :param max_tasks: Maximum number of concurrent tasks.
+        :param rate_limit: Delay between requests to the same domain (in seconds).
+        :param update_interval: Time interval (in seconds) to update the visualization.
+        :param max_pages: Maximum number of pages to crawl.
+        """
+        self.seed_urls = seed_urls
+        self.max_tasks = max_tasks
+        self.rate_limit = rate_limit
+        self.visited = set()
+        self.session = None
+        self.robots_parsers = {}
+        self.domain_last_access = {}
+        self.update_interval = update_interval  # Seconds between visualization updates
+        self.graph = Network(height='750px', width='100%', directed=True, notebook=True, bgcolor='#222222', font_color='white')
+        self.max_pages = max_pages
+        self.semaphore = Semaphore(max_tasks)  # Limit concurrent tasks
+
+        # Initialize the graph with seed nodes
+        for url in self.seed_urls:
+            self.graph.add_node(
+                url,
+                label=url,
+                title='Seed URL',
+                color='#1f78b4'  # Seed node color
+            )
+
+    async def fetch(self, url, retries=3):
+        """
+        Fetch the content of a URL asynchronously with retries.
+
+        :param url: The URL to fetch.
+        :param retries: Number of retry attempts.
+        :return: The HTML content if successful, else None.
+        """
+        headers = {
+            'User-Agent': 'MyWebCrawler/1.0 (+https://www.example.com/crawler-info)'
+        }
+        for attempt in range(1, retries + 1):
+            try:
+                async with self.session.get(url, timeout=10, headers=headers) as response:
+                    if response.status == 200 and 'text/html' in response.headers.get('Content-Type', ''):
+                        logger.info(f"Fetched URL: {url}")
+                        return await response.text()
+                    else:
+                        logger.warning(f"[{response.status}] Skipping URL (Non-HTML content): {url}")
+                        return None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.error(f"[Attempt {attempt}/{retries}] Error fetching {url}: {e}")
+                await asyncio.sleep(2)  # Wait before retrying
+        logger.error(f"[Failed] Could not fetch {url} after {retries} attempts.")
+        return None
+
+    async def parse(self, html, base_url):
+        """
+        Parse the HTML content to extract the title, meta description, and hyperlinks.
+
+        :param html: HTML content as a string.
+        :param base_url: The base URL to resolve relative links.
+        :return: A dictionary with extracted data.
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        title = soup.title.string.strip() if soup.title else 'No Title'
+        meta_desc = ''
+        if soup.find('meta', attrs={'name': 'description'}):
+            meta_desc = soup.find('meta', attrs={'name': 'description'}).get('content', '').strip()
+        links = set()
+        for link in soup.find_all('a', href=True):
+            href = link.get('href')
+            # Resolve relative URLs
+            full_url = urljoin(base_url, href)
+            parsed_url = urlparse(full_url)
+            # Normalize URL (remove fragments, etc.)
+            normalized_url = parsed_url._replace(fragment='').geturl()
+            # Optional: Add URL filters here (e.g., exclude certain file types)
+            if self.is_valid_url(normalized_url):
+                links.add(normalized_url)
+        return {
+            'url': base_url,
+            'title': title,
+            'meta_description': meta_desc,
+            'links': list(links)  # Convert set to list for JSON serialization
+        }
+
+    def is_valid_url(self, url):
+        """
+        Validate the URL to exclude unwanted file types or patterns.
+
+        :param url: The URL to validate.
+        :return: True if valid, False otherwise.
+        """
+        EXCLUDE_EXTENSIONS = (
+            '.jpg', '.jpeg', '.png', '.gif', '.pdf', '.docx', '.xlsx',
+            '.zip', '.tar.gz', '.rar', '.exe', '.svg', '.mp3', '.mp4'
+        )
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        if parsed.path.endswith(EXCLUDE_EXTENSIONS):
+            return False
+        return True
+
+    async def get_robots_parser(self, url):
+        """
+        Retrieve and parse the robots.txt for a given URL's domain.
+
+        :param url: The URL to get robots.txt for.
+        :return: A robotparser.RobotFileParser object or None.
+        """
+        parsed_url = urlparse(url)
+        domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        if domain in self.robots_parsers:
+            return self.robots_parsers[domain]
+
+        robots_url = urljoin(domain, '/robots.txt')
+        rp = robotparser.RobotFileParser()
+        try:
+            async with self.session.get(robots_url, timeout=10) as response:
+                if response.status == 200:
+                    robots_txt = await response.text()
+                    rp.parse(robots_txt.split('\n'))
+                    crawl_delay = rp.crawl_delay("*")
+                    if crawl_delay:
+                        self.rate_limit = max(self.rate_limit, crawl_delay)
+                    logger.info(f"Parsed robots.txt for {domain}")
+                else:
+                    rp = None  # No robots.txt found or inaccessible
+                    logger.warning(f"No robots.txt found for {domain}")
+        except Exception as e:
+            logger.error(f"Failed to fetch robots.txt for {domain}: {e}")
+            rp = None
+        self.robots_parsers[domain] = rp
+        return rp
+
+    async def can_fetch(self, url):
+        """
+        Determine if the crawler is allowed to fetch the given URL based on robots.txt.
+
+        :param url: The URL to check.
+        :return: True if allowed, False otherwise.
+        """
+        rp = await self.get_robots_parser(url)
+        if rp is None:
+            return True  # Assume allowed if robots.txt is unavailable
+        return rp.can_fetch("*", url)
+
+    async def wait_for_rate_limit(self, url):
+        """
+        Enforce rate limiting per domain.
+
+        :param url: The URL to be fetched.
+        """
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
+        last_access = self.domain_last_access.get(domain, 0)
+        elapsed = asyncio.get_event_loop().time() - last_access
+        if elapsed < self.rate_limit:
+            wait_time = self.rate_limit - elapsed
+            logger.debug(f"Rate limiting: Waiting {wait_time:.2f} seconds before fetching {url}")
+            await asyncio.sleep(wait_time)
+        self.domain_last_access[domain] = asyncio.get_event_loop().time()
+
+    async def crawl(self):
+        """
+        The main crawling logic.
+        """
+        connector = aiohttp.TCPConnector(limit_per_host=self.max_tasks)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            self.session = session
+            tasks = []
+            for url in self.seed_urls:
+                tasks.append(asyncio.create_task(self.process_url(url, depth=0)))
+            # Start the visualization updater
+            updater_task = asyncio.create_task(self.visualization_updater())
+            await asyncio.gather(*tasks)
+            updater_task.cancel()
+
+    async def process_url(self, url, depth):
+        """
+        Process a single URL: fetch, parse, and enqueue new links.
+
+        :param url: The URL to process.
+        :param depth: Current depth level.
+        """
+        async with self.semaphore:
+            if len(self.visited) >= self.max_pages:
+                logger.info(f"Reached maximum page limit: {self.max_pages}")
+                return
+
+            if url in self.visited:
+                logger.debug(f"Already visited: {url}")
+                return
+            self.visited.add(url)
+
+            if not await self.can_fetch(url):
+                logger.info(f"[Blocked by robots.txt] {url}")
+                return
+
+            try:
+                await self.wait_for_rate_limit(url)
+                html = await self.fetch(url)
+                if html is None:
+                    return
+
+                data = await self.parse(html, url)
+                logger.info(f"---\nURL: {data['url']}\nTitle: {data['title']}\nDescription: {data['meta_description']}\nLinks Found: {len(data['links'])}\n---")
+
+                # Add to PyVis network
+                self.add_to_network(data)
+
+                # For demonstration, limit the crawling depth to 1
+                MAX_DEPTH = 4
+                if depth < MAX_DEPTH:
+                    tasks = []
+                    for link in data['links']:
+                        if link not in self.visited:
+                            tasks.append(asyncio.create_task(self.process_url(link, depth + 1)))
+                    if tasks:
+                        # Use gather with return_exceptions=True to handle individual task errors
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, Exception):
+                                logger.error(f"Error in child task: {result}")
+
+            except Exception as e:
+                logger.error(f"Unhandled exception in processing {url}: {e}")
+
+    def add_to_network(self, data):
+        """
+        Add nodes and edges to the PyVis network.
+
+        :param data: Dictionary containing extracted data.
+        """
+        source = data['url']
+        title = data['title']
+        description = data['meta_description']
+        links = data['links']
+
+        # Add source node with title and description
+        self.graph.add_node(
+            source,
+            label=title,
+            title=f"{title}<br>{description}",
+            color='#1f78b4'  # Source node color
+        )
+
+        for link in links:
+            # Add target node; PyVis handles duplicates internally
+            self.graph.add_node(
+                link,
+                label=urlparse(link).netloc,
+                title=link,
+                color='#33a02c'  # Target node color
+            )
+            # Add edge from source to target
+            self.graph.add_edge(source, link, color='#e31a1c')
+
+    async def visualization_updater(self):
+        """
+        Periodically update the visualization by rendering the network graph within the notebook.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.update_interval)
+                self.render_graph()
+        except asyncio.CancelledError:
+            pass
+
+    def render_graph(self):
+        """
+        Render the PyVis network within the Jupyter Notebook.
+        """
+        # Generate the network HTML as a string
+        network_html = self.graph.generate_html(notebook=True)
+        # Display the HTML
+        display(HTML(network_html))
+
+    def run(self):
+        """
+        Start the crawling and visualization process.
+        """
+        asyncio.run(self.crawl())
+        # After crawling, render the final graph
+        self.render_graph()
+
+# Initialize and run the crawler
+# Change seed URL to target website
+seed_urls = ['https://elliottelford.com']
+
+# Create an instance of WebCrawler
+crawler = WebCrawler(
+    seed_urls=seed_urls,
+    max_tasks=10,          # Maximum concurrent tasks
+    rate_limit=1,          # 1 second delay between requests to the same domain
+    update_interval=10,    # Update visualization every 10 seconds
+    max_pages=50           # Limit to 50 pages for demonstration
+)
+
+# Run the crawler
+crawler.run()
